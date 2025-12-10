@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>BC Treasury</title>
+  <title>Secondary Market — Bond Auction Game</title>
   <style>
     /* Simple modern styling */
     :root{--bg:#0f1724;--card:#0b1220;--accent:#7dd3fc;--muted:#9ca3af;--glass: rgba(255,255,255,0.03)}
@@ -41,11 +41,13 @@
   <div class="wrap">
     <header>
       <div>
-        <h1>BC Treasury</h1>
-        <div class="sub">Made by James Degenhardt, B-07, BC</div>
+        <h1>Secondary Market — Government Bond Auctions</h1>
+        <div class="sub">Real-feel secondary market simulation — preset funds, live auctions, AI bidders, and maturities.</div>
       </div>
       <div class="controls">
-        <button id="resetBtn" class="mutebtn"></button>
+        <div class="mini">Fast Mode (for testing):</div>
+        <label style="display:flex;align-items:center;gap:8px"><input id="fastMode" type="checkbox"> seconds=minutes</label>
+        <button id="resetBtn" class="mutebtn">Reset Game</button>
       </div>
     </header>
 
@@ -130,24 +132,29 @@
 
       </main>
     </div>
+
+    <footer>
+      Tip: Use <strong>Fast Mode</strong> to make "minutes" equal seconds for quick testing. Auctions still follow the 5-minute cycle but scaled down.
+    </footer>
   </div>
 
 <script>
 /* Bond auction single-file game logic */
 (function(){
   // --- Game state ---
-  const state = {
-    balance: 1000, // player cash
-    portfolio: [], // owned bonds
-    nextBondId: 1,
-    auctionCycleMs: 9 * 60 * 1000, // 5 minutes
-    auctionDurationMs: 4 * 60 * 1000, // 3 minutes
-    fastMode: false,
-    auctionTimerHandle: null,
-    auctionPhase: 'waiting',
-    currentAuction: null,
-    auctionHistory: []
-  };
+const state = {
+  balance: 1_000_000,
+  portfolio: [],
+  nextBondId: 1,
+  auctionCycleMs: 5 * 60 * 1000,
+  auctionDurationMs: 3 * 60 * 1000,
+  fastMode: false,
+  auctionTimerHandle: null,
+  auctionPhase: 'waiting',
+  currentAuction: null,
+  auctionHistory: []
+};
+
 
   // DOM
   const balanceDisplay = document.getElementById('balanceDisplay');
@@ -166,6 +173,7 @@
   const placeBidBtn = document.getElementById('placeBidBtn');
   const clearBidsBtn = document.getElementById('clearBidsBtn');
   const resetBtn = document.getElementById('resetBtn');
+  const fastModeChk = document.getElementById('fastMode');
   const auctionSizeEl = document.getElementById('auctionSize');
 
   function logEvent(txt){
@@ -293,16 +301,23 @@
       } else {
         state.balance -= actualPlayerCost;
         // add bond to portfolio as a position with assignedFace and purchase price
-        const pos = {
-          id: auction.bond.id,
-          couponRate: auction.bond.couponRate,
-          maturityYears: auction.bond.maturityYears,
-          face: playerTotalAssigned,
-          pricePer100: avgPrice,
-          purchaseTime: new Date(),
-          yield: yieldAnnual
-        };
-        state.portfolio.push(pos);
+      const now = Date.now();
+const maturityMs =
+  auction.bond.maturityYears * msPerGameYear();
+
+const pos = {
+  id: auction.bond.id,
+  couponRate: auction.bond.couponRate,
+  maturityYears: auction.bond.maturityYears,
+  face: playerTotalAssigned,
+  pricePer100: avgPrice,
+  purchaseTime: now,
+  maturityTime: now + maturityMs,
+  yield: yieldAnnual
+};
+
+state.portfolio.push(pos);
+
         logEvent(`Auction ${auction.bond.id} settled: avgPrice=$${avgPrice} | yield=${yieldAnnual}% | you received ${playerTotalAssigned.toLocaleString()} face for $${actualPlayerCost.toFixed(2)}`);
       }
     } else {
@@ -401,7 +416,11 @@
   function renderPortfolio(){
     const el = document.getElementById('portfolioList'); el.innerHTML='';
     let totalPV=0;
-    state.portfolio.forEach((p,idx)=>{
+   const now = Date.now();
+state.portfolio.forEach((p,idx)=>{
+  const remainingMs = p.maturityTime - now;
+  const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+
       // present value estimate: simple: face * (price/100)
       const cost = (p.face/100)*p.pricePer100;
       // not discounting coupons — approximate
@@ -420,6 +439,42 @@
       historyTableBody.appendChild(tr);
     });
   }
+function processMaturities(){
+  const now = Date.now();
+  let matured = [];
+
+  state.portfolio = state.portfolio.filter(bond => {
+    if(now >= bond.maturityTime){
+      matured.push(bond);
+      return false; // remove from portfolio
+    }
+    return true;
+  });
+
+  matured.forEach(bond => {
+    // Face value repayment
+    const faceValue = bond.face;
+
+    // Simple interest payout:
+    // couponRate is annual %, maturityYears applies fully
+    const interest =
+      bond.face * (bond.couponRate / 100) * bond.maturityYears;
+
+    const payout = faceValue + interest;
+
+    state.balance += payout;
+
+    logEvent(
+      `Bond ${bond.id} matured → paid ${balanceFmt(payout)} ` +
+      `(face ${balanceFmt(faceValue)} + interest ${balanceFmt(interest)})`
+    );
+  });
+
+  if(matured.length){
+    renderBalance();
+    renderPortfolio();
+  }
+}
 
   // UI timers
   function startUITimer(){
@@ -436,7 +491,9 @@
         auctionTimer.textContent = '--:--';
         auctionPhaseEl.textContent = 'waiting';
       }
-    }, 500);
+    processMaturities();
+
+      }, 500);
   }
 
   // Reset game
