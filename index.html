@@ -142,12 +142,14 @@
 /* Bond auction single-file game logic */
 (function(){
   // --- Game state ---
+const STORAGE_KEY = 'BC_TREASURY_SAVE_V1';
+
 const state = {
   balance: 1_000_000,
   portfolio: [],
   nextBondId: 1,
-  auctionCycleMs: 5 * 60 * 1000,
-  auctionDurationMs: 3 * 60 * 1000,
+  auctionCycleMs: 5 * 60 * 1000,     // 5 minutes cycle
+  auctionDurationMs: 3 * 60 * 1000,  // 3 minutes open
   fastMode: false,
   auctionTimerHandle: null,
   auctionPhase: 'waiting',
@@ -155,8 +157,13 @@ const state = {
   auctionHistory: []
 };
 
+// ms per game-year (normal = real year; fastMode compressed for testing)
+function msPerGameYear() {
+  return state.fastMode ? 60 * 1000 : 365 * 24 * 60 * 60 * 1000;
+}
 
-  // DOM
+
+// DOM
   const balanceDisplay = document.getElementById('balanceDisplay');
   const portfolioValueEl = document.getElementById('portfolioValue');
   const auctionTimer = document.getElementById('auctionTimer');
@@ -181,19 +188,53 @@ const state = {
     eventLog.prepend(p);
   }
 
-  // --- Bond generation ---
-  function generateBond(){
+  // -------------------------
+  // deterministic PRNG helper for generating identical auctions across devices
+  // seed: number (e.g., cycleStart millis)
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+  }
+
+  // -------------------------
+  // getAuctionTimes: compute UTC-aligned cycle boundaries
+  function getAuctionTimes(ts = Date.now()) {
+    const now = ts;
+    const cycle = state.auctionCycleMs;
+    const dur = state.auctionDurationMs;
+
+    // Align to absolute UTC cycle boundary
+    const cycleStart = now - (now % cycle);
+    const auctionStart = cycleStart;
+    const auctionEnd = cycleStart + dur;
+    const nextCycleStart = cycleStart + cycle;
+
+    return {
+      auctionStart,
+      auctionEnd,
+      nextCycleStart,
+      cycleStart
+    };
+  }
+
+  // --- Bond generation (changed slightly to allow deterministic generation when a seed is provided)
+  function generateBond(seed = null){
     // Each bond has: id, couponRate (annual %), maturityMinutes, issuanceFace, description
+    // If seed is provided, use deterministic values so all clients see identical bond
     const id = state.nextBondId++;
+    let rnd = Math.random;
+    if(seed !== null){
+      rnd = mulberry32(Number(seed & 0xffffffff));
+    }
     // Randomize coupon between 0.25% and 8% (annual)
-    const coupon = +(Math.random() * 7.75 + 0.25).toFixed(3);
-    // Randomize maturity between 1 year and 30 years, but in minutes notion for simulation
-    // We'll pick maturity in years first
-    const maturityYears = Math.floor(Math.random()*29)+1; // 1..29
-    // In-game maturity minutes (for real-time maturity when scaled): choose days->minutes mapping
-    const maturityMinutes = maturityYears * 60 * 24 * 365 / 60; // unrealistic; instead map 1 year -> 60 minutes for demo
-    // We'll use 1 year = 60 minutes if fastMode, otherwise 1 year = 60*24*60 minutes — but to keep UI friendly, show years and also minutes to maturity
-    // For allocation ease, issuance size:
+    const coupon = +( (rnd() * 7.75 + 0.25).toFixed(3) );
+    // Randomize maturity between 1 year and 30 years
+    const maturityYears = Math.floor(rnd()*29)+1; // 1..29
+    // issuance size:
     const issuance = 100_000; // face amount available in auction
     const bond = {
       id: `B-${String(id).padStart(4,'0')}`,
@@ -206,14 +247,17 @@ const state = {
   }
 
   // --- Auction model ---
-  function startNewAuction(){
-    const bond = generateBond();
+  // startNewAuction creates an auction. When called from UTC sync we pass cycleStart as seed so bond is deterministic.
+  function startNewAuction(cycleSeed = null){
+    // If cycleSeed provided, generate deterministic bond using it; otherwise random
+    const bond = generateBond(cycleSeed);
     state.currentAuction = {
       bond,
-      bids: [], // {who:'player'|'botX', pricePer100, qtyFace}
+      bids: [], // {who:'N/A'|'botX', pricePer100, qtyFace}
       createdAt: Date.now(),
       startsAt: Date.now(),
-      endsAt: Date.now() + state.auctionDurationMs
+      endsAt: Date.now() + state.auctionDurationMs,
+      cycleStart: cycleSeed || null
     };
     auctionSizeEl.textContent = bond.issuanceFace.toLocaleString();
     renderCurrentBond();
@@ -221,10 +265,16 @@ const state = {
     auctionPhaseEl.textContent = 'open';
     state.auctionPhase = 'open';
     logEvent(`Auction opened: ${bond.id} — ${bond.description}`);
-    // schedule end
-    setTimeout(() => closeAuction(state.currentAuction), state.auctionDurationMs);
+    // schedule end locally as a fallback; primary closure comes from syncTick
+    setTimeout(() => {
+      // only close if still the same auction and time passed the end
+      if(state.currentAuction && Date.now() >= state.currentAuction.endsAt){
+        closeAuction(state.currentAuction);
+      }
+    }, state.auctionDurationMs + 100);
   }
 
+  // closeAuction unchanged logic (keeps allocation rules)
   function closeAuction(auction){
     if(!state.currentAuction || auction !== state.currentAuction) return;
     state.auctionPhase = 'settling';
@@ -233,10 +283,10 @@ const state = {
     const bids = auction.bids;
     if(bids.length === 0){
       logEvent(`Auction ${auction.bond.id} closed with no bids — bond unsold.`);
-      state.auctionHistory.unshift({time: new Date(), bond:auction.bond, avgPrice:null, yield:null, issued:0});
+      state.auctionHistory.unshift({time: new Date(), bond:auction.bond, avgPrice:null, yield:null, issued:0, cycleStart: auction.cycleStart});
       renderHistory();
       state.currentAuction = null;
-      // schedule next auction at cycle boundary
+      // schedule next auction at cycle boundary (UTC-driven)
       scheduleNextAuction();
       return;
     }
@@ -318,6 +368,9 @@ const pos = {
 
 state.portfolio.push(pos);
 
+// save immediately after purchase
+saveState();
+
         logEvent(`Auction ${auction.bond.id} settled: avgPrice=$${avgPrice} | yield=${yieldAnnual}% | you received ${playerTotalAssigned.toLocaleString()} face for $${actualPlayerCost.toFixed(2)}`);
       }
     } else {
@@ -325,30 +378,37 @@ state.portfolio.push(pos);
     }
 
     // record to history
-    state.auctionHistory.unshift({time: new Date(), bond:auction.bond, avgPrice, yield: yieldAnnual, issued: issuance});
+    state.auctionHistory.unshift({time: new Date(), bond:auction.bond, avgPrice, yield: yieldAnnual, issued: issuance, cycleStart: auction.cycleStart});
+    // persist
+    saveState();
+
     renderHistory();
     renderPortfolio();
     renderBalance();
 
     // cleanup
     state.currentAuction = null;
+    // schedule next auction per UTC schedule
     scheduleNextAuction();
   }
 
-  // schedule next auction to start at the next cycle boundary: auctions every 5 minutes
+  // scheduleNextAuction: align with UTC cycle boundary (keeps compatibility with earlier code paths)
   function scheduleNextAuction(){
-    // For simplicity: start a new auction after (auctionCycleMs - auctionDurationMs) from now.
-    const gap = Math.max(1000, state.auctionCycleMs - state.auctionDurationMs);
+    // compute next cycle start from current time
+    const times = getAuctionTimes();
+    const now = Date.now();
+    const gap = Math.max(1000, times.nextCycleStart - now);
     setTimeout(()=>{
-      // Simulate bots placing some preliminary bids for the new auction
-      startNewAuction();
-      // let bots bid periodically during the open auction
+      // Start auction deterministically for that cycle
+      const cycleStart = times.nextCycleStart;
+      // To ensure deterministic bond across devices, pass cycleStart as seed
+      startNewAuction(cycleStart);
       simulateBotsDuringAuction();
     }, gap);
   }
 
   // --- Bots ---
-  const botNames = ['AlphaBot','BetaBot','GammaBot','DeltaBot','Epsilon'];
+  const botNames = ['Eshaan','Trever','Ryan R','John B','Epsilon','Francis','Adam R','Tom','Jackson D','Alex D','Dylan','Shriman','Daniel L','Lily','Phill','Juan','Anna','Samuel','Mallary'];
   function simulateBotsDuringAuction(){
     if(!state.currentAuction) return;
     const auction = state.currentAuction;
@@ -384,6 +444,8 @@ state.portfolio.push(pos);
     state.currentAuction.bids.push({who:'player', pricePer100:+price, qtyFace:qty});
     logEvent(`You placed bid: $${price.toFixed(2)} per 100 | qty ${qty.toLocaleString()}`);
     renderAuctionBook();
+    // save bids to persistence
+    saveState();
   }
 
   function clearPlayerBids(){
@@ -391,8 +453,77 @@ state.portfolio.push(pos);
     state.currentAuction.bids = state.currentAuction.bids.filter(b=>b.who !== 'player');
     logEvent('Cleared your bids for current auction.');
     renderAuctionBook();
+    saveState();
   }
 
+  // -------------------------
+  // Persistence: save/load using localStorage
+  function saveState(){
+    try{
+      const serial = JSON.stringify({
+        balance: state.balance,
+        portfolio: state.portfolio,
+        nextBondId: state.nextBondId,
+        auctionHistory: state.auctionHistory,
+        currentAuction: sanitizeAuctionForSave(state.currentAuction)
+      });
+      localStorage.setItem(STORAGE_KEY, serial);
+    }catch(e){
+      console.warn('Save failed', e);
+    }
+  }
+
+  function sanitizeAuctionForSave(auction){
+    if(!auction) return null;
+    // Save minimal auction state so we can resume (bids, bond, endsAt, cycleStart)
+    return {
+      bond: auction.bond,
+      bids: auction.bids,
+      createdAt: auction.createdAt,
+      startsAt: auction.startsAt,
+      endsAt: auction.endsAt,
+      cycleStart: auction.cycleStart
+    };
+  }
+
+  function loadState(){
+    try{
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if(!raw) return;
+      const obj = JSON.parse(raw);
+      if(obj.balance!=null) state.balance = obj.balance;
+      if(Array.isArray(obj.portfolio)) state.portfolio = obj.portfolio.map(p=>{
+        // defensive: ensure numbers are numbers
+        p.purchaseTime = Number(p.purchaseTime);
+        p.maturityTime = Number(p.maturityTime);
+        return p;
+      });
+      if(obj.nextBondId!=null) state.nextBondId = obj.nextBondId;
+      if(Array.isArray(obj.auctionHistory)) state.auctionHistory = obj.auctionHistory;
+      if(obj.currentAuction){
+        const ca = obj.currentAuction;
+        // if saved auction still active, resume it
+        if(typeof ca.endsAt === 'number' && Date.now() < ca.endsAt){
+          state.currentAuction = {
+            bond: ca.bond,
+            bids: ca.bids || [],
+            createdAt: ca.createdAt || Date.now(),
+            startsAt: ca.startsAt || Date.now(),
+            endsAt: ca.endsAt,
+            cycleStart: ca.cycleStart || null
+          };
+          state.auctionPhase = 'open';
+        } else {
+          // expired: ignore and let schedule start next
+          state.currentAuction = null;
+        }
+      }
+    }catch(e){
+      console.warn('Load failed', e);
+    }
+  }
+
+  // -------------------------
   // Rendering functions
   function renderBalance(){ balanceDisplay.textContent = balanceFmt(state.balance); }
   function renderAuctionBook(){
@@ -439,6 +570,7 @@ state.portfolio.forEach((p,idx)=>{
       historyTableBody.appendChild(tr);
     });
   }
+
 function processMaturities(){
   const now = Date.now();
   let matured = [];
@@ -473,27 +605,75 @@ function processMaturities(){
   if(matured.length){
     renderBalance();
     renderPortfolio();
+    saveState();
   }
 }
 
-  // UI timers
+  // -------------------------
+  // Sync tick: align auctions to UTC cycle and open/close deterministically
+  function syncTick(){
+    const now = Date.now();
+    const times = getAuctionTimes(now);
+
+    // determine if auction should be open in this cycle
+    if(now >= times.auctionStart && now < times.auctionEnd){
+      // auction should be open for this cycle
+      if(!state.currentAuction || (state.currentAuction.cycleStart !== times.cycleStart)){
+        // start deterministic auction for this cycle
+        state.currentAuction = null; // clear any leftover
+        // set nextBondId deterministically if needed: keep using increasing nextBondId but deterministic bond uses cycleStart seed
+        startNewAuction(times.cycleStart);
+        // if there were bids persisted for this cycle, try to restore them (loadState already does this)
+        simulateBotsDuringAuction();
+      } else {
+        // already running correct auction
+      }
+    } else {
+      // Not within open-window
+      // If auction just ended, ensure close is called once
+      if(state.currentAuction && now >= state.currentAuction.endsAt){
+        // close the auction deterministically
+        closeAuction(state.currentAuction);
+      }
+      // ensure currentAuction cleared when appropriate
+      if(state.currentAuction && now >= times.nextCycleStart){
+        state.currentAuction = null;
+      }
+    }
+
+    // Update auction timer UI every tick
+    if(state.currentAuction){
+      const remaining = Math.max(0, state.currentAuction.endsAt - now);
+      const sec = Math.ceil(remaining/1000);
+      const mm = Math.floor(sec/60); const ss = sec%60;
+      auctionTimer.textContent = `${mm.toString().padStart(2,'0')}:${ss.toString().padStart(2,'0')}`;
+      auctionPhaseEl.textContent = state.auctionPhase;
+    } else {
+      // show time until next cycle start
+      const untilNext = Math.max(0, times.nextCycleStart - now);
+      const sec = Math.ceil(untilNext/1000);
+      const mm = Math.floor(sec/60); const ss = sec%60;
+      auctionTimer.textContent = `Next in ${mm.toString().padStart(2,'0')}:${ss.toString().padStart(2,'0')}`;
+      auctionPhaseEl.textContent = 'waiting';
+    }
+
+    // check maturities each tick
+    processMaturities();
+
+    // periodically persist state (also autosave)
+  }
+
+  // UI timers (keeps previous behavior but ties into syncTick)
   function startUITimer(){
     if(state.auctionTimerHandle) clearInterval(state.auctionTimerHandle);
     state.auctionTimerHandle = setInterval(()=>{
-      // update auction timer and phase
-      if(state.currentAuction){
-        const now = Date.now();
-        const remaining = Math.max(0, state.currentAuction.endsAt - now);
-        const sec = Math.ceil(remaining/1000);
-        const mm = Math.floor(sec/60); const ss = sec%60;
-        auctionTimer.textContent = `${mm.toString().padStart(2,'0')}:${ss.toString().padStart(2,'0')}`;
-      } else {
-        auctionTimer.textContent = '--:--';
-        auctionPhaseEl.textContent = 'waiting';
-      }
-    processMaturities();
-
-      }, 500);
+      // call syncTick which updates UI & handles opening/closing auctions
+      syncTick();
+      // keep rendering auction book & portfolio
+      renderAuctionBook();
+      renderCurrentBond();
+      renderPortfolio();
+    }, 1000);
   }
 
   // Reset game
@@ -506,8 +686,8 @@ function processMaturities(){
     state.auctionHistory = [];
     state.auctionPhase = 'waiting';
     renderBalance(); renderPortfolio(); renderHistory(); auctionBookEl.innerHTML=''; currentBondEl.innerHTML=''; eventLog.innerHTML='';
-    // schedule first auction shortly
-    setTimeout(()=>{ startNewAuction(); simulateBotsDuringAuction(); }, 1000);
+    saveState();
+    // schedule first auction shortly (UTC scheduler will start at next tick)
   }
 
   // Wire events
@@ -516,20 +696,36 @@ function processMaturities(){
   resetBtn.addEventListener('click', ()=>resetGame());
   fastModeChk.addEventListener('change', ()=>{
     state.fastMode = fastModeChk.checked;
+    // when fastMode toggled, update msPerGameYear behavior and auction timings (for local testing)
     if(state.fastMode){
       state.auctionCycleMs = 5 * 1000; state.auctionDurationMs = 3 * 1000;
     } else { state.auctionCycleMs = 5*60*1000; state.auctionDurationMs = 3*60*1000; }
     logEvent('Fast Mode ' + (state.fastMode ? 'ENABLED' : 'DISABLED'));
+    // save change to state
+    saveState();
   });
+
+  // -------------------------
+  // Autosave every 2s and ensure initial load
+  function autosaveLoop(){
+    setInterval(()=>saveState(), 2000);
+  }
 
   // Initialize
   function init(){
+    loadState();
     renderBalance(); renderPortfolio(); renderHistory(); startUITimer();
-    // start first auction in 2 seconds
-    setTimeout(()=>{ startNewAuction(); simulateBotsDuringAuction(); }, 1200);
-    // schedule recurring auctions: every auctionCycleMs (startNewAuction called after each closure)
+    autosaveLoop();
+    // call syncTick immediately to align auctions
+    syncTick();
+    // schedule recurring: no setTimeout-based schedule required because syncTick will start auctions at UTC boundaries
   }
   init();
+
+  // Expose saveState to console for debugging if needed
+  window.BCT_save = saveState;
+  window.BCT_load = loadState;
+
 })();
 </script>
 </body>
