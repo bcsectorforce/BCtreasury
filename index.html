@@ -441,7 +441,7 @@ saveState();
     const qty = parseInt(bidQtyInput.value);
     if(isNaN(price) || isNaN(qty) || price<=0 || qty<=0){ alert('Enter valid bid and quantity.'); return; }
     // store bid
-    state.currentAuction.bids.push({who:'player', pricePer100:+price, qtyFace:qty});
+    state.currentAuction.bids.push({who:'N/A', pricePer100:+price, qtyFace:qty});
     logEvent(`You placed bid: $${price.toFixed(2)} per 100 | qty ${qty.toLocaleString()}`);
     renderAuctionBook();
     // save bids to persistence
