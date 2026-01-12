@@ -225,7 +225,7 @@ function msPerGameYear() {
   function generateBond(seed = null){
     // Each bond has: id, couponRate (annual %), maturityMinutes, issuanceFace, description
     // If seed is provided, use deterministic values so all clients see identical bond
-    const id = state.nextBondId++;
+    const id = Math.floor(seed / state.auctionCycleMs);
     let rnd = Math.random;
     if(seed !== null){
       rnd = mulberry32(Number(seed & 0xffffffff));
@@ -237,7 +237,7 @@ function msPerGameYear() {
     // issuance size:
     const issuance = 100_000; // face amount available in auction
     const bond = {
-      id: `B-${String(id).padStart(4,'0')}`,
+      id: `B-${id}`,
       couponRate: coupon, // annual %
       maturityYears: maturityYears,
       issuanceFace: issuance,
@@ -248,31 +248,23 @@ function msPerGameYear() {
 
   // --- Auction model ---
   // startNewAuction creates an auction. When called from UTC sync we pass cycleStart as seed so bond is deterministic.
-  function startNewAuction(cycleSeed = null){
-    // If cycleSeed provided, generate deterministic bond using it; otherwise random
-    const bond = generateBond(cycleSeed);
-    state.currentAuction = {
-      bond,
-      bids: [], // {who:'N/A'|'botX', pricePer100, qtyFace}
-      createdAt: Date.now(),
-      startsAt: Date.now(),
-      endsAt: Date.now() + state.auctionDurationMs,
-      cycleStart: cycleSeed || null
-    };
-    auctionSizeEl.textContent = bond.issuanceFace.toLocaleString();
-    renderCurrentBond();
-    renderAuctionBook();
-    auctionPhaseEl.textContent = 'open';
-    state.auctionPhase = 'open';
-    logEvent(`Auction opened: ${bond.id} — ${bond.description}`);
-    // schedule end locally as a fallback; primary closure comes from syncTick
-    setTimeout(() => {
-      // only close if still the same auction and time passed the end
-      if(state.currentAuction && Date.now() >= state.currentAuction.endsAt){
-        closeAuction(state.currentAuction);
-      }
-    }, state.auctionDurationMs + 100);
-  }
+  function startNewAuction(cycleStart){
+  const bond = generateBond(cycleStart);
+
+  state.currentAuction = {
+    bond,
+    bids: [],
+    createdAt: cycleStart,
+    startsAt: cycleStart,
+    endsAt: cycleStart + state.auctionDurationMs,
+    cycleStart
+  };
+
+  auctionPhaseEl.textContent = 'open';
+  state.auctionPhase = 'open';
+  logEvent(`Auction opened: ${bond.id}`);
+}
+
 
   // closeAuction unchanged logic (keeps allocation rules)
   function closeAuction(auction){
@@ -287,7 +279,6 @@ function msPerGameYear() {
       renderHistory();
       state.currentAuction = null;
       // schedule next auction at cycle boundary (UTC-driven)
-      scheduleNextAuction();
       return;
     }
     let totalNotional=0, weighted=0;
@@ -334,7 +325,8 @@ function msPerGameYear() {
     }
 
     // settle: charge players and bots receive allocations (bots ignored). Player may have multiple bids; process any entries with who === 'player'
-    const playerBids = resolved.filter(r=>r.who === 'player' && r.assignedFace>0);
+    const playerBids = resolved.filter(r => r.who === 'player' && r.assignedFace > 0);
+
     const playerTotalAssigned = playerBids.reduce((s,r)=>s + r.assignedFace,0);
     const playerCost = playerTotalAssigned/100 * avgPrice; // per 100 face
     // convert to actual dollars: price per 100 face times number of lots (face/100)
@@ -389,24 +381,10 @@ saveState();
     // cleanup
     state.currentAuction = null;
     // schedule next auction per UTC schedule
-    scheduleNextAuction();
   }
 
   // scheduleNextAuction: align with UTC cycle boundary (keeps compatibility with earlier code paths)
-  function scheduleNextAuction(){
-    // compute next cycle start from current time
-    const times = getAuctionTimes();
-    const now = Date.now();
-    const gap = Math.max(1000, times.nextCycleStart - now);
-    setTimeout(()=>{
-      // Start auction deterministically for that cycle
-      const cycleStart = times.nextCycleStart;
-      // To ensure deterministic bond across devices, pass cycleStart as seed
-      startNewAuction(cycleStart);
-      simulateBotsDuringAuction();
-    }, gap);
-  }
-
+  
   // --- Bots ---
   const botNames = ['Eshaan','Trever','Ryan R','John B','Epsilon','Francis','Adam R','Tom','Jackson D','Alex D','Dylan','Shriman','Daniel L','Lily','Phill','Juan','Anna','Samuel','Mallary'];
   function simulateBotsDuringAuction(){
@@ -441,7 +419,7 @@ saveState();
     const qty = parseInt(bidQtyInput.value);
     if(isNaN(price) || isNaN(qty) || price<=0 || qty<=0){ alert('Enter valid bid and quantity.'); return; }
     // store bid
-    state.currentAuction.bids.push({who:'N/A', pricePer100:+price, qtyFace:qty});
+    state.currentAuction.bids.push({who:'player', pricePer100:+price, qtyFace:qty});
     logEvent(`You placed bid: $${price.toFixed(2)} per 100 | qty ${qty.toLocaleString()}`);
     renderAuctionBook();
     // save bids to persistence
@@ -465,7 +443,6 @@ saveState();
         portfolio: state.portfolio,
         nextBondId: state.nextBondId,
         auctionHistory: state.auctionHistory,
-        currentAuction: sanitizeAuctionForSave(state.currentAuction)
       });
       localStorage.setItem(STORAGE_KEY, serial);
     }catch(e){
@@ -566,7 +543,8 @@ state.portfolio.forEach((p,idx)=>{
     historyTableBody.innerHTML = '';
     state.auctionHistory.slice(0,30).forEach(row=>{
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${row.time.toLocaleTimeString()}</td><td>${row.bond.id}</td><td>${row.bond.maturityYears}</td><td>${row.avgPrice===null?'-':('$'+row.avgPrice)}</td><td>${row.yield===null?'-':row.yield+'%'}</td><td>${row.issued.toLocaleString()}</td>`;
+      tr.innerHTML = `<td>${new Date(row.time).toLocaleTimeString()}</td>
+<td>${row.bond.id}</td><td>${row.bond.maturityYears}</td><td>${row.avgPrice===null?'-':('$'+row.avgPrice)}</td><td>${row.yield===null?'-':row.yield+'%'}</td><td>${row.issued.toLocaleString()}</td>`;
       historyTableBody.appendChild(tr);
     });
   }
@@ -655,7 +633,8 @@ function processMaturities(){
       const mm = Math.floor(sec/60); const ss = sec%60;
       auctionTimer.textContent = `Next in ${mm.toString().padStart(2,'0')}:${ss.toString().padStart(2,'0')}`;
       auctionPhaseEl.textContent = 'waiting';
-    }
+      state.auctionPhase = 'waiting'; 
+      }
 
     // check maturities each tick
     processMaturities();
@@ -665,16 +644,16 @@ function processMaturities(){
 
   // UI timers (keeps previous behavior but ties into syncTick)
   function startUITimer(){
-    if(state.auctionTimerHandle) clearInterval(state.auctionTimerHandle);
-    state.auctionTimerHandle = setInterval(()=>{
-      // call syncTick which updates UI & handles opening/closing auctions
-      syncTick();
-      // keep rendering auction book & portfolio
-      renderAuctionBook();
-      renderCurrentBond();
-      renderPortfolio();
-    }, 1000);
-  }
+  if(state.auctionTimerHandle) clearInterval(state.auctionTimerHandle);
+
+  state.auctionTimerHandle = setInterval(()=>{
+    syncTick();
+    renderAuctionBook();
+    renderCurrentBond();
+    renderPortfolio();
+  }, 1000);
+}
+
 
   // Reset game
   function resetGame(){
@@ -698,8 +677,8 @@ function processMaturities(){
     state.fastMode = fastModeChk.checked;
     // when fastMode toggled, update msPerGameYear behavior and auction timings (for local testing)
     if(state.fastMode){
-      state.auctionCycleMs = 5 * 1000; state.auctionDurationMs = 3 * 1000;
-    } else { state.auctionCycleMs = 5*60*1000; state.auctionDurationMs = 3*60*1000; }
+    
+    } else {  }
     logEvent('Fast Mode ' + (state.fastMode ? 'ENABLED' : 'DISABLED'));
     // save change to state
     saveState();
@@ -713,7 +692,7 @@ function processMaturities(){
 
   // Initialize
   function init(){
-    loadState();
+    loadState(); syncTick();   
     renderBalance(); renderPortfolio(); renderHistory(); startUITimer();
     autosaveLoop();
     // call syncTick immediately to align auctions
