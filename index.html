@@ -750,7 +750,7 @@ function processMaturities(){
   // Reset game
   function resetGame(){
     if(!confirm('Reset the game? This will wipe your balance and portfolio.')) return;
-    state.balance = 1_000_000;
+    state.balance = 1_000;
     state.portfolio = [];
     state.nextBondId = 1;
     state.currentAuction = null;
