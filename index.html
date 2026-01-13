@@ -485,19 +485,21 @@ saveState();
 
   // -------------------------
   // Persistence: save/load using localStorage
-  function saveState(){
-    try{
-      const serial = JSON.stringify({
-        balance: state.balance,
-        portfolio: state.portfolio,
-        nextBondId: state.nextBondId,
-        auctionHistory: state.auctionHistory,
-      });
-      localStorage.setItem(STORAGE_KEY, serial);
-    }catch(e){
-      console.warn('Save failed', e);
-    }
+ function saveState(){
+  try{
+    const serial = JSON.stringify({
+      balance: state.balance,
+      portfolio: state.portfolio,
+      nextBondId: state.nextBondId,
+      auctionHistory: state.auctionHistory,
+      currentAuction: sanitizeAuctionForSave(state.currentAuction), // <-- add this
+    });
+    localStorage.setItem(STORAGE_KEY, serial);
+  }catch(e){
+    console.warn('Save failed', e);
   }
+}
+
 
   function sanitizeAuctionForSave(auction){
     if(!auction) return null;
