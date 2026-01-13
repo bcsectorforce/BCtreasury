@@ -60,7 +60,7 @@
             <div class="small">Portfolio value: <span id="portfolioValue">$0.00</span></div>
           </div>
           <div style="text-align:right">
-            <div class="small">Current Auction</div>
+            <div class="small"></div>
             <div class="auction-timer" id="auctionTimer">--:--</div>
             <div class="small">Phase: <span id="auctionPhase">Waiting</span></div>
           </div>
@@ -123,7 +123,7 @@
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div><strong>Market History</strong> <div class="mini">Last auctions</div></div>
-            <div class="mini">You cannot sell bonds; when maturity occurs you receive face + coupon proceeds.</div>
+            <div class="mini">All bonds auctioned on BC Treasury are non-marketable securities</div>
           </div>
           <div style="margin-top:8px">
             <table id="historyTable"><thead><tr><th>Time</th><th>Bond ID</th><th>Maturity (yrs)</th><th>Avg Price</th><th>Yield (%)</th><th>Qty Issued</th></tr></thead><tbody></tbody></table>
@@ -233,16 +233,25 @@ function msPerGameYear() {
     // Randomize coupon between 0.25% and 8% (annual)
     const coupon = +( (rnd() * 7.75 + 0.25).toFixed(3) );
     // Randomize maturity between 1 year and 30 years
-    const maturityYears = Math.floor(rnd()*29)+1; // 1..29
+    // Randomize maturity between 1 minute and 1440 minutes (24 hours)
+const maturityMinutes = Math.floor(rnd() * 60) + 1; // 1..1440 minutes
+
     // issuance size:
-    const issuance = 100_000; // face amount available in auction
-    const bond = {
-      id: `B-${id}`,
-      couponRate: coupon, // annual %
-      maturityYears: maturityYears,
-      issuanceFace: issuance,
-      description: `${maturityYears}-year Treasury-like bond @ ${coupon}% coupon`
-    };
+const issuance = 100_000; // face amount available in auction
+
+// Convert minutes to years
+const maturityYears = maturityMinutes / 525600; // 525,600 minutes per year
+
+const bond = {
+  id: `B-${id}`,
+  couponRate: coupon, // annual %
+  maturityMinutes: maturityMinutes,
+  maturityYears: maturityYears,   // now properly defined
+  issuanceFace: issuance,
+  description: `${maturityMinutes}-minute Treasury-like bond @ ${coupon}% coupon`
+};
+
+
     return bond;
   }
 
@@ -251,9 +260,14 @@ function msPerGameYear() {
   function startNewAuction(cycleStart){
   const bond = generateBond(cycleStart);
 
+const rnd = mulberry32(cycleStart & 0xffffffff);
+
+  const minPrice = +(90 + rnd() * 10).toFixed(2); // 90.00–100.00
+
   state.currentAuction = {
     bond,
     bids: [],
+    minPrice,
     createdAt: cycleStart,
     startsAt: cycleStart,
     endsAt: cycleStart + state.auctionDurationMs,
@@ -281,13 +295,40 @@ function msPerGameYear() {
       // schedule next auction at cycle boundary (UTC-driven)
       return;
     }
-    let totalNotional=0, weighted=0;
-    bids.forEach(b=>{ totalNotional += b.qtyFace; weighted += b.qtyFace * b.pricePer100; });
-    const avgPrice = +(weighted / totalNotional).toFixed(4); // per 100 face
+    const minAllowed = auction.minPrice;
+const validBids = bids.filter(b => (b.pricePer100 >= minAllowed) && (b.isValid !== false));
+
+// filter valid bids (defensive)
+
+if(validBids.length === 0){
+  logEvent(`Auction ${auction.bond.id} `);
+  state.auctionHistory.unshift({
+    time: new Date(),
+    bond: auction.bond,
+    avgPrice: null,
+    yield: null,
+    issued: 0,
+    cycleStart: auction.cycleStart
+  });
+  state.currentAuction = null;
+  return;
+}
+
+// clearing price = lowest bid
+const clearingPrice = Math.min(...validBids.map(b => b.pricePer100));
+const avgPrice = +clearingPrice.toFixed(4); // reuse variable name
+// per 100 face
     // compute simple annual yield approximation: (coupon + (100 - price)/yrs) / ((100+price)/2)
     const yrs = auction.bond.maturityYears;
     const coupon = auction.bond.couponRate;
-    const yieldAnnual = +(((coupon + ((100 - avgPrice)/yrs)) / ((100+avgPrice)/2)) * 100).toFixed(4);
+    const yieldAnnual = +(
+  (
+    coupon +
+    (100 - avgPrice) / yrs
+  ) /
+  avgPrice * 100
+).toFixed(4);
+
     // allocation: issuance divided proportionally across bidders
     const issuance = auction.bond.issuanceFace;
     const allocations = bids.map(b=>({who:b.who, qtyAllocated: Math.floor(b.qtyFace/100)})); // in lots of 100 face
@@ -344,8 +385,7 @@ function msPerGameYear() {
         state.balance -= actualPlayerCost;
         // add bond to portfolio as a position with assignedFace and purchase price
       const now = Date.now();
-const maturityMs =
-  auction.bond.maturityYears * msPerGameYear();
+const maturityMs = auction.bond.maturityMinutes * 60 * 1000;
 
 const pos = {
   id: auction.bond.id,
@@ -402,8 +442,9 @@ saveState();
           const bot = botNames[Math.floor(Math.random()*botNames.length)];
           // bot chooses price around a range depending on coupon: aim near 100
           const coupon = auction.bond.couponRate;
-          const base = 100 - (coupon - 2) + (Math.random()*2 -1) * 2.5; // roughness
-          const price = +(base + (Math.random()*4 - 2)).toFixed(4);
+         let price = +(90 + Math.random() * 10).toFixed(2); // random 90.00–100.00
+
+
           const qty = (Math.floor(Math.random()*40)+1)*100; // lots of 100
           auction.bids.push({who:bot, pricePer100:price, qtyFace:qty});
         }
@@ -414,17 +455,25 @@ saveState();
 
   // Player interactions
   function placePlayerBid(){
-    if(!state.currentAuction){ alert('No active auction.'); return; }
-    const price = parseFloat(bidPriceInput.value);
-    const qty = parseInt(bidQtyInput.value);
-    if(isNaN(price) || isNaN(qty) || price<=0 || qty<=0){ alert('Enter valid bid and quantity.'); return; }
-    // store bid
-    state.currentAuction.bids.push({who:'player', pricePer100:+price, qtyFace:qty});
+  if(!state.currentAuction){ alert('No active auction.'); return; }
+  const price = parseFloat(bidPriceInput.value);
+  const qty = parseInt(bidQtyInput.value);
+  if(isNaN(price) || isNaN(qty) || price<=0 || qty<=0){ alert('Enter valid bid and quantity.'); return; }
+
+  // store bid anyway, visually
+  state.currentAuction.bids.push({who:'player', pricePer100:+price, qtyFace:qty, isValid: price >= state.currentAuction.minPrice});
+
+  // log event differently if invalid
+  if(price < state.currentAuction.minPrice){
+    logEvent(`You placed bid: $${price.toFixed(2)} per 100 | qty ${qty.toLocaleString()} `);
+  } else {
     logEvent(`You placed bid: $${price.toFixed(2)} per 100 | qty ${qty.toLocaleString()}`);
-    renderAuctionBook();
-    // save bids to persistence
-    saveState();
   }
+
+  renderAuctionBook();
+  saveState();
+}
+
 
   function clearPlayerBids(){
     if(!state.currentAuction) return;
@@ -517,9 +566,26 @@ saveState();
     currentBondEl.innerHTML = '';
     if(!state.currentAuction){ currentBondEl.textContent = 'No live bond right now. An auction will open on schedule.'; return; }
     const b = state.currentAuction.bond;
-    const box = document.createElement('div'); box.className='bond';
-    box.innerHTML = `<div style='flex:1'><div style='font-weight:800'>${b.id} — ${b.couponRate}% coupon</div><div class='mini'>${b.description}</div><div class='mini'>Maturity: ${b.maturityYears} years</div></div><div style='text-align:right'><div class='mini'>Issuance</div><div style='font-weight:800'>${b.issuanceFace.toLocaleString()} face</div></div>`;
-    currentBondEl.appendChild(box);
+const box = document.createElement('div'); 
+box.className = 'bond';
+
+box.innerHTML = `
+  <div style='flex:1'>
+    <div style='font-weight:800'>${b.id} — ${b.couponRate}% coupon</div>
+    <div class='mini'>${b.description}</div>
+    <div class='mini'>Maturity: ${b.maturityYears} years</div>
+  </div>
+  <div style='text-align:right'>
+    <div class='mini'>Issuance</div>
+    <div style='font-weight:800'>${b.issuanceFace.toLocaleString()} face</div>
+  </div>
+  
+`;
+
+currentBondEl.appendChild(box);
+
+
+
   }
   function renderPortfolio(){
     const el = document.getElementById('portfolioList'); el.innerHTML='';
@@ -527,27 +593,51 @@ saveState();
    const now = Date.now();
 state.portfolio.forEach((p,idx)=>{
   const remainingMs = p.maturityTime - now;
-  const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+ const remainingMin = Math.max(0, Math.ceil(remainingMs / 60000));
 
       // present value estimate: simple: face * (price/100)
       const cost = (p.face/100)*p.pricePer100;
       // not discounting coupons — approximate
       totalPV += cost;
       const d = document.createElement('div'); d.className='bond';
-      d.innerHTML = `<div><div style='font-weight:700'>${p.id}</div><div class='mini'>face ${p.face.toLocaleString()} | coupon ${p.couponRate}% | yield ${p.yield}%</div></div><div style='text-align:right'><div class='mini'>paid</div><div style='font-weight:800'>${balanceFmt(cost)}</div></div>`;
+      d.innerHTML = `<div>
+  <div style='font-weight:700'>${p.id}</div>
+  <div class='mini'>
+    face ${p.face.toLocaleString()} | coupon ${p.couponRate}% | yield ${p.yield}% | remaining ${remainingMin} min
+  </div>
+</div>
+<div style='text-align:right'>
+  <div class='mini'>paid</div>
+  <div style='font-weight:800'>${balanceFmt(cost)}</div>
+</div>`;
+
       el.appendChild(d);
     });
     portfolioValueEl.textContent = balanceFmt(totalPV);
   }
   function renderHistory(){
-    historyTableBody.innerHTML = '';
-    state.auctionHistory.slice(0,30).forEach(row=>{
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${new Date(row.time).toLocaleTimeString()}</td>
-<td>${row.bond.id}</td><td>${row.bond.maturityYears}</td><td>${row.avgPrice===null?'-':('$'+row.avgPrice)}</td><td>${row.yield===null?'-':row.yield+'%'}</td><td>${row.issued.toLocaleString()}</td>`;
-      historyTableBody.appendChild(tr);
-    });
-  }
+  historyTableBody.innerHTML = '';
+  state.auctionHistory.slice(0,30).forEach(row=>{
+    const bond = row.bond;
+    // Convert minutes to years (approx 525600 minutes per year)
+    const maturityYears = bond.maturityMinutes ? (bond.maturityMinutes / 525600).toFixed(2) : bond.maturityYears || '-';
+    
+    const avgPriceDisplay = row.avgPrice === null ? '-' : '$' + row.avgPrice;
+    const yieldDisplay = row.yield === null ? '-' : row.yield + '%';
+    
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${new Date(row.time).toLocaleTimeString()}</td>
+      <td>${bond.id}</td>
+      <td>${maturityYears}</td>
+      <td>${avgPriceDisplay}</td>
+      <td>${yieldDisplay}</td>
+      <td>${row.issued.toLocaleString()}</td>
+    `;
+    historyTableBody.appendChild(tr);
+  });
+}
+
 
 function processMaturities(){
   const now = Date.now();
